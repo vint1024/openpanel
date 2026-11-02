@@ -21,4 +21,5 @@ git push git@github.com:vint1024/openpanel.git v3.20.0
 gh workflow run build-images.yml -R vint1024/openpanel -f version=3.20.0
 ```
 
-The upstream workflows of this fork are disabled.
+Only release tags are copied here. `main` is left as it was at fork time and is never synced,
+so the upstream workflows (which live on `main`) never run in this fork.
