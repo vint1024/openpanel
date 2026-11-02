@@ -13,8 +13,13 @@ name: Build OpenPanel images
 #   git push git@github.com:vint1024/openpanel.git v3.20.0
 # Upstream tags a commit only after its own tests and smoke run pass, so they are not re-run here.
 #
+# Runtimes: the Dockerfiles take the Node and Bun versions as build args (ARG NODE_VERSION,
+# ARG BUN_VERSION). Left empty, the upstream defaults of the tag are used. Set, they replace
+# them — meant for a newer patch release of the same line (e.g. Node 24.22.1 → 24.22.2);
+# the code is not touched. The versions used are written into the image description label.
+#
 # Triggers: manually only (Actions → Build OpenPanel images → Run workflow, or
-#   gh workflow run build-images.yml -R vint1024/openpanel -f version=3.20.0).
+#   gh workflow run build-images.yml -R vint1024/openpanel -f version=3.20.0 [-f node_version=24.22.2]).
 # Auth uses the built-in GITHUB_TOKEN (packages: write) — no secrets to manage.
 
 on:
@@ -23,6 +28,14 @@ on:
       version:
         description: 'Upstream version without "v", e.g. 3.20.0'
         required: true
+      node_version:
+        description: 'Node for the dashboard image, e.g. 24.22.2 (empty = upstream default)'
+        required: false
+        default: ''
+      bun_version:
+        description: 'Bun for both images, e.g. 1.4.5 (empty = upstream default)'
+        required: false
+        default: ''
 
 permissions:
   contents: read
@@ -63,6 +76,34 @@ jobs:
           ref: v${{ inputs.version }}
           persist-credentials: false
 
+      - name: Build arguments
+        id: args
+        env:
+          NODE_IN: ${{ inputs.node_version }}
+          BUN_IN: ${{ inputs.bun_version }}
+          EXTRA: ${{ matrix.build_args }}
+          DOCKERFILE: ${{ matrix.dockerfile }}
+        run: |
+          for v in "$NODE_IN" "$BUN_IN"; do
+            [[ -z "$v" || "$v" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::runtime version must look like 24.22.2, got '$v'"; exit 1; }
+          done
+          # Only the ARGs this Dockerfile declares (the api image has no Node); defaults of the tag
+          # go into the label when an input is empty.
+          node_default=$(sed -nE 's/^ARG NODE_VERSION=//p' "$DOCKERFILE")
+          bun_default=$(sed -nE 's/^ARG BUN_VERSION=//p' "$DOCKERFILE")
+          [ -n "$bun_default" ] || { echo "::error::$DOCKERFILE has no ARG BUN_VERSION"; exit 1; }
+          if [ -z "$node_default" ]; then NODE_IN=; fi
+          node=${NODE_IN:-$node_default}
+          bun=${BUN_IN:-$bun_default}
+          {
+            echo 'list<<EOF'
+            if [ -n "$EXTRA" ]; then echo "$EXTRA"; fi
+            if [ -n "$NODE_IN" ]; then echo "NODE_VERSION=$NODE_IN"; fi
+            if [ -n "$BUN_IN" ]; then echo "BUN_VERSION=$BUN_IN"; fi
+            echo EOF
+            echo "runtimes=bun ${bun}${node:+, node $node}"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v4
 
@@ -80,10 +121,10 @@ jobs:
           context: .
           file: ${{ matrix.dockerfile }}
           platforms: linux/${{ matrix.arch }}
-          build-args: ${{ matrix.build_args }}
+          build-args: ${{ steps.args.outputs.list }}
           labels: |
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.description=OpenPanel ${{ matrix.app }} ${{ inputs.version }}, built unmodified from upstream tag v${{ inputs.version }}
+            org.opencontainers.image.description=OpenPanel ${{ matrix.app }} ${{ inputs.version }}, built unmodified from upstream tag v${{ inputs.version }} (${{ steps.args.outputs.runtimes }})
             org.opencontainers.image.version=${{ inputs.version }}
             org.opencontainers.image.licenses=AGPL-3.0
           outputs: type=image,name=${{ env.REGISTRY }}/openpanel-${{ matrix.app }},push-by-digest=true,name-canonical=true,push=true
