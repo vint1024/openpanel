@@ -1,0 +1,137 @@
+name: Build OpenPanel images
+
+# Builds the OpenPanel images (api and dashboard) from an upstream release tag, unmodified,
+# for amd64 + arm64 on GitHub's native runners, and publishes them to GHCR:
+#   ghcr.io/vint1024/openpanel-api:<version>         e.g. :3.20.0
+#   ghcr.io/vint1024/openpanel-dashboard:<version>
+# The worker is the api image started with ROLE=worker (upstream since 3.0).
+#
+# Upstream (Openpanel-dev/openpanel, AGPL-3.0) publishes its v3 images to supporters only;
+# the source is public and this fork just builds it. The tag `v<version>` must exist in
+# this fork — push it from upstream first:
+#   git fetch --depth=1 https://github.com/Openpanel-dev/openpanel.git refs/tags/v3.20.0:refs/tags/v3.20.0
+#   git push git@github.com:vint1024/openpanel.git v3.20.0
+# Upstream tags a commit only after its own tests and smoke run pass, so they are not re-run here.
+#
+# Triggers: manually only (Actions → Build OpenPanel images → Run workflow, or
+#   gh workflow run build-images.yml -R vint1024/openpanel -f version=3.20.0).
+# Auth uses the built-in GITHUB_TOKEN (packages: write) — no secrets to manage.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Upstream version without "v", e.g. 3.20.0'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-${{ inputs.version }}
+  cancel-in-progress: true
+
+env:
+  REGISTRY: ghcr.io/vint1024
+  VERSION: ${{ inputs.version }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.app }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-24.04' }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [api, dashboard]
+        arch: [amd64, arm64]
+        include:
+          - app: api
+            dockerfile: apps/api/Dockerfile
+            build_args: DATABASE_URL=postgresql://dummy:dummy@localhost:5432/dummy
+          - app: dashboard
+            dockerfile: apps/start/Dockerfile
+    steps:
+      - name: Check the version
+        run: |
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "::error::version must look like 3.20.0, got '$VERSION'"; exit 1; }
+
+      - name: Checkout v${{ inputs.version }}
+        uses: actions/checkout@v7
+        with:
+          ref: v${{ inputs.version }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          build-args: ${{ matrix.build_args }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.description=OpenPanel ${{ matrix.app }} ${{ inputs.version }}, built unmodified from upstream tag v${{ inputs.version }}
+            org.opencontainers.image.version=${{ inputs.version }}
+            org.opencontainers.image.licenses=AGPL-3.0
+          outputs: type=image,name=${{ env.REGISTRY }}/openpanel-${{ matrix.app }},push-by-digest=true,name-canonical=true,push=true
+
+      - name: Export digest
+        run: |
+          mkdir -p /tmp/digests
+          digest="${{ steps.build.outputs.digest }}"
+          touch "/tmp/digests/${digest#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ matrix.app }}-${{ matrix.arch }}
+          path: /tmp/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    name: Publish ${{ matrix.app }}
+    needs: [build]
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        app: [api, dashboard]
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v8
+        with:
+          path: /tmp/digests
+          pattern: digest-${{ matrix.app }}-*
+          merge-multiple: true
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create and push the manifest list
+        working-directory: /tmp/digests
+        env:
+          IMAGE: ${{ env.REGISTRY }}/openpanel-${{ matrix.app }}
+        run: |
+          docker buildx imagetools create -t "$IMAGE:$VERSION" $(printf "$IMAGE@sha256:%s " *)
+          docker buildx imagetools inspect "$IMAGE:$VERSION"
